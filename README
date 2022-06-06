@@ -1,0 +1,1 @@
+A simple toy implementation of the HeapLang language with a Hindley-Milner type system (partially tbd) and an automatic solver for separation logic based program specifications (tbd).
