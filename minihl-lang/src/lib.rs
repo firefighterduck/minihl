@@ -1,20 +1,25 @@
 #![feature(box_patterns)]
+#![feature(let_chains)]
 
 mod lang_defs;
 mod types;
 
 pub use lang_defs::{BinOp, Expr, Literal, UnOp, Val};
-pub use types::{Type, TypeDict, TypeError, TypeResult};
+pub use types::{
+    MonoType, Type, TypeContext, TypeError, TypeResult, Unifiable, BOOL_T, FUN, INT_T, LOCATION,
+    PROD, SUM, UNIT_T,
+};
+use types::{MonoTypeResult, TypeUnifier, TypingResult, UNIT};
 
-fn expect_un_op_type(un_op: &UnOp) -> Type {
+fn expect_un_op_type(un_op: &UnOp) -> MonoType {
     match un_op {
-        UnOp::Neg => Type::BoolT,
-        UnOp::MinusUn => Type::IntT,
+        UnOp::Neg => BOOL_T,
+        UnOp::MinusUn => INT_T,
     }
 }
 
-fn expect_bin_op_type(bi_op: &BinOp, dict: &mut TypeDict) -> (Type, Type, Type) {
-    use Type::*;
+fn expect_bin_op_type(bi_op: &BinOp, ctxt: &mut TypeContext) -> (MonoType, MonoType, MonoType) {
+    use MonoType::*;
     match bi_op {
         BinOp::Plus
         | BinOp::Minus
@@ -22,28 +27,28 @@ fn expect_bin_op_type(bi_op: &BinOp, dict: &mut TypeDict) -> (Type, Type, Type) 
         | BinOp::Quot
         | BinOp::Rem
         | BinOp::ShiftL
-        | BinOp::ShiftR => (IntT, IntT, IntT),
-        BinOp::And | BinOp::Or | BinOp::Xor => (BoolT, BoolT, BoolT),
-        BinOp::Le | BinOp::Lt | BinOp::Eq => (IntT, IntT, BoolT),
+        | BinOp::ShiftR => (INT_T, INT_T, INT_T),
+        BinOp::And | BinOp::Or | BinOp::Xor => (BOOL_T, BOOL_T, BOOL_T),
+        BinOp::Le | BinOp::Lt | BinOp::Eq => (INT_T, INT_T, BOOL_T),
         BinOp::Offset => {
-            let var = dict.new_var();
+            let var = ctxt.new_var();
             (
-                LocationT(Box::new(Free(var))),
-                IntT,
-                LocationT(Box::new(Free(var))),
+                MonoType::constr(LOCATION, vec![Free(var)]).unwrap(),
+                INT_T,
+                MonoType::constr(LOCATION, vec![Free(var)]).unwrap(),
             )
         }
     }
 }
 
-fn type_check_lit(lit: &Literal, dict: &mut TypeDict) -> TypeResult {
+fn type_check_lit(lit: &Literal, ctxt: &mut TypeContext) -> MonoTypeResult {
     Ok(match lit {
-        Literal::Int(_) => Type::IntT,
-        Literal::Bool(_) => Type::BoolT,
-        Literal::Unit => Type::UnitT,
+        Literal::Int(_) => INT_T,
+        Literal::Bool(_) => BOOL_T,
+        Literal::Unit => UNIT_T,
         Literal::Loc(_) => {
-            let var = dict.new_var();
-            Type::LocationT(Box::new(Type::Free(var)))
+            let var = ctxt.new_var();
+            MonoType::constr(LOCATION, vec![MonoType::Free(var)])?
         }
     })
 }
@@ -52,212 +57,224 @@ fn type_check_lambda(
     fun_name: &Option<String>,
     arg_name: &Option<String>,
     expr: &Expr,
-    dict: &mut TypeDict,
-) -> TypeResult {
+    ctxt: &mut TypeContext,
+) -> TypingResult {
     let mut old_fun_type = None;
     let mut old_arg_type = None;
-    let body_type_var = dict.new_var();
-    let arg_type_var = dict.new_var();
+    let body_type_var = ctxt.new_var();
+    let arg_type_var = ctxt.new_var();
 
-    let mut fun_type = Type::FunT(
-        Box::new(Type::Free(arg_type_var)),
-        Box::new(Type::Free(body_type_var)),
-    );
+    let mut fun_type = MonoType::constr(
+        FUN,
+        vec![MonoType::Free(arg_type_var), MonoType::Free(body_type_var)],
+    )?;
 
     // Shadow old variables with the same name.
     if let Some(fun_name) = fun_name {
-        old_fun_type = dict.insert(fun_name.clone(), fun_type.clone());
+        old_fun_type = ctxt.insert(fun_name.clone(), Type::Mono(fun_type.clone()));
     };
     if let Some(arg_name) = arg_name {
-        old_arg_type = dict.insert(arg_name.clone(), Type::Free(arg_type_var));
+        old_arg_type = ctxt.insert(arg_name.clone(), Type::Mono(MonoType::Free(arg_type_var)));
     };
 
-    let body_type = type_check(expr, dict)?;
+    // Type the body and instantiate the function type with the obtained unifiers.
+    let (body_type, unifiers) = type_check(expr, ctxt)?;
+    fun_type = MonoType::constr(FUN, vec![MonoType::Free(arg_type_var), body_type])?;
+    fun_type.instantiate_from_unifiers(&unifiers);
 
     // Unshadow the old variables or introduce the new function.
-    if let Some(fun_name) = fun_name {
-        let typ = old_fun_type.unwrap_or_else(|| fun_type.clone());
-        dict.insert(fun_name.clone(), typ);
-    };
     if let Some(arg_name) = arg_name {
-        let arg_type = dict.get_type(arg_name).unwrap().clone();
-
-        if let Some(old_arg_type) = old_arg_type {
-            dict.insert(arg_name.clone(), old_arg_type);
+        if let Some(mut old_arg_type) = old_arg_type {
+            old_arg_type.instantiate_from_unifiers(&unifiers);
+            ctxt.insert(arg_name.clone(), old_arg_type);
         } else {
-            dict.drop_var(arg_name);
+            ctxt.drop_var(arg_name);
         }
-
-        fun_type = Type::FunT(Box::new(arg_type), Box::new(body_type));
-    } else {
-        fun_type = Type::FunT(Box::new(Type::Free(arg_type_var)), Box::new(body_type));
     }
 
-    Ok(fun_type)
+    if let Some(fun_name) = fun_name {
+        let mut typ = old_fun_type.unwrap_or_else(|| Type::Mono(fun_type.clone()));
+        typ.instantiate_from_unifiers(&unifiers);
+        ctxt.insert(fun_name.clone(), typ);
+    };
+
+    Ok((fun_type, unifiers))
 }
 
-fn type_check_val(val: &Val, dict: &mut TypeDict) -> TypeResult {
+fn type_check_val(val: &Val, ctxt: &mut TypeContext) -> TypingResult {
     match val {
-        Val::LitV(lit) => type_check_lit(lit, dict),
+        Val::LitV(lit) => type_check_lit(lit, ctxt).map(|typ| (typ, vec![])),
         Val::RecV {
             fun_name,
             arg_name,
             expr,
-        } => type_check_lambda(fun_name, arg_name, expr, dict),
+        } => type_check_lambda(fun_name, arg_name, expr, ctxt),
         Val::PairV(fst, snd) => {
-            let fst_type = type_check_val(fst, dict)?;
-            let snd_type = type_check_val(snd, dict)?;
-            Ok(Type::ProdT(Box::new(fst_type), Box::new(snd_type)))
+            let (fst_type, mut unifiers1) = type_check_val(fst, ctxt)?;
+            let (snd_type, mut unifiers2) = type_check_val(snd, ctxt)?;
+            unifiers1.append(&mut unifiers2);
+            MonoType::constr(PROD, vec![fst_type, snd_type]).map(|typ| (typ, unifiers1))
         }
-        Val::InjLV(sum) => {
-            if let Type::SumT(left_type, _) = type_check_val(sum, dict)? {
-                Ok(*left_type)
-            } else {
-                Err(TypeError::TypeMismatch)
-            }
+        Val::InjLV(left) => {
+            let (left_type, unifiers) = type_check_val(left, ctxt)?;
+            MonoType::constr(SUM, vec![left_type, MonoType::Free(ctxt.new_var())])
+                .map(|typ| (typ, unifiers))
         }
-        Val::InjR(sum) => {
-            if let Type::SumT(_, right_type) = type_check_val(sum, dict)? {
-                Ok(*right_type)
-            } else {
-                Err(TypeError::TypeMismatch)
-            }
+        Val::InjR(right) => {
+            let (right_type, unifiers) = type_check_val(right, ctxt)?;
+            MonoType::constr(SUM, vec![MonoType::Free(ctxt.new_var()), right_type])
+                .map(|typ| (typ, unifiers))
         }
     }
 }
 
 fn type_check_sum(
     sum: &Expr,
-    dict: &mut TypeDict,
-    handler: impl Fn(Type, Type, &mut TypeDict) -> TypeResult,
-) -> TypeResult {
-    let sum_type = type_check(sum, dict)?;
-    let mut expected_sum = Type::SumT(
-        Box::new(Type::Free(dict.new_var())),
-        Box::new(Type::Free(dict.new_var())),
-    );
-
-    let unifier = expected_sum.unify(&sum_type)?;
-    dict.fix_from_unifier(&unifier);
-    expected_sum.instantiate_from_unifier(&unifier);
-
-    if let Type::SumT(box l_type, box r_type) = expected_sum {
-        handler(l_type, r_type, dict)
-    } else {
-        unreachable!()
-    }
+    ctxt: &mut TypeContext,
+    handler: impl Fn(&MonoType, &MonoType, &mut TypeContext, Vec<TypeUnifier>) -> TypingResult,
+) -> TypingResult {
+    let (sum_type, unifiers) = type_check(sum, ctxt)?;
+    let args = sum_type.args(&SUM)?;
+    handler(args.get(0).unwrap(), args.get(1).unwrap(), ctxt, unifiers)
 }
 
-pub fn type_check(expr: &Expr, dict: &mut TypeDict) -> TypeResult {
+pub fn type_check(expr: &Expr, ctxt: &mut TypeContext) -> TypingResult {
     match expr {
-        Expr::Val(v) => type_check_val(v, dict),
-        Expr::Var(v) => dict.get_type(v).cloned().ok_or(TypeError::VarNotFound),
+        Expr::Val(v) => type_check_val(v, ctxt),
+        Expr::Var(v) => ctxt
+            .get_type(v)
+            .cloned()
+            .ok_or(TypeError::VarNotFound)
+            .map(|typ| (ctxt.monomorphize(&typ), vec![])),
         Expr::Rec {
             fun_name,
             arg_name,
             expr,
-        } => type_check_lambda(fun_name, arg_name, expr, dict),
+        } => type_check_lambda(fun_name, arg_name, expr, ctxt),
         Expr::App(f_expr, a_expr) => {
-            if let Type::FunT(box arg_type, box mut body_type) = type_check(f_expr, dict)? {
-                let arg_type_checked = type_check(a_expr, dict)?;
+            let (mut fun_type, mut unifiers1) = type_check(f_expr, ctxt)?;
+            let (arg_type, mut unifiers2) = type_check(a_expr, ctxt)?;
 
-                let unifier = arg_type_checked.unify(&arg_type)?;
-                body_type.instantiate_from_unifier(&unifier);
-                dict.fix_from_unifier(&unifier);
+            fun_type.instantiate_from_unifiers(&unifiers2);
+            let result_var = ctxt.new_var();
+            let fun_type_mgu = MonoType::constr(FUN, vec![arg_type, MonoType::Free(result_var)])?;
+            let mgu = fun_type.unify_with(&fun_type_mgu)?;
+            ctxt.fix_from_unifier(&mgu);
 
-                Ok(body_type.clone())
-            } else {
-                Err(TypeError::TypeMismatch)
-            }
+            mgu.get_or_var(&result_var)
+                .ok_or(TypeError::UnificationFailed)
+                .map(|typ| {
+                    unifiers1.append(&mut unifiers2);
+                    unifiers1.push(mgu);
+                    (typ, unifiers1)
+                })
         }
         Expr::UnOp(un_op, expr) => {
             let expected_type = expect_un_op_type(un_op);
-            let actual_type = type_check(expr, dict)?;
-            expected_type
-                .unify(&actual_type)
-                .map(|unifier| {
-                    dict.fix_from_unifier(&unifier);
-                    expected_type
-                })
-                .map_err(From::from)
+            let (actual_type, mut unifiers) = type_check(expr, ctxt)?;
+            let unifier = actual_type.unify_with(&expected_type)?;
+            ctxt.fix_from_unifier(&unifier);
+            unifiers.push(unifier);
+            Ok((expected_type, unifiers))
         }
         Expr::BinOp(bin_op, arg1, arg2) => {
-            let (exp_arg1, exp_arg2, res_type) = expect_bin_op_type(bin_op, dict);
-            let actual_arg1 = type_check(arg1, dict)?;
-            let mut actual_arg2 = type_check(arg2, dict)?;
+            let (exp_arg1, exp_arg2, res_type) = expect_bin_op_type(bin_op, ctxt);
 
-            let unifier1 = exp_arg1.unify(&actual_arg1)?;
-            actual_arg2.instantiate_from_unifier(&unifier1);
-            dict.fix_from_unifier(&unifier1);
+            let (actual_arg1, mut unifiers1) = type_check(arg1, ctxt)?;
+            let unifier1 = actual_arg1.unify_with(&exp_arg1)?;
+            ctxt.fix_from_unifier(&unifier1);
+            unifiers1.push(unifier1);
 
-            let unifier2 = exp_arg2.unify(&actual_arg2)?;
-            dict.fix_from_unifier(&unifier2);
+            let (actual_arg2, mut unifiers2) = type_check(arg2, ctxt)?;
+            let unifier2 = actual_arg2.unify_with(&exp_arg2)?;
+            ctxt.fix_from_unifier(&unifier2);
+            unifiers2.push(unifier2);
 
-            Ok(res_type)
+            unifiers1.append(&mut unifiers2);
+
+            Ok((res_type, unifiers1))
         }
         Expr::If {
             condition,
             then_branch,
             else_branch,
         } => {
-            let cond_type = type_check(condition, dict)?;
-            let mut then_type = type_check(then_branch, dict)?;
-            let mut else_type = type_check(else_branch, dict)?;
-
+            let (cond_type, mut unifiers1) = type_check(condition, ctxt)?;
             // Make sure the condition is a boolean
-            let unifier1 = cond_type.unify(&Type::BoolT)?;
-            then_type.instantiate_from_unifier(&unifier1);
-            else_type.instantiate_from_unifier(&unifier1);
-            dict.fix_from_unifier(&unifier1);
+            let unifier1 = cond_type.unify_with(&BOOL_T)?;
+            ctxt.fix_from_unifier(&unifier1);
+            unifiers1.push(unifier1);
+
+            let (mut then_type, mut unifiers2) = type_check(then_branch, ctxt)?;
+            let (else_type, mut unifiers3) = type_check(else_branch, ctxt)?;
 
             // Make sure, both branches have the same type
-            let unifier2 = then_type.unify(&else_type)?;
+            let unifier2 = then_type.unify_with(&else_type)?;
             then_type.instantiate_from_unifier(&unifier2);
-            dict.fix_from_unifier(&unifier2);
+            ctxt.fix_from_unifier(&unifier2);
 
-            Ok(then_type)
+            unifiers1.append(&mut unifiers2);
+            unifiers1.append(&mut unifiers3);
+            unifiers1.push(unifier2);
+
+            Ok((then_type, unifiers1))
         }
         Expr::Pair(fst, snd) => {
-            let fst_type = type_check(fst, dict)?;
-            let snd_type = type_check(snd, dict)?;
-            Ok(Type::ProdT(Box::new(fst_type), Box::new(snd_type)))
+            let (fst_type, mut unifiers1) = type_check(fst, ctxt)?;
+            let (snd_type, mut unifiers2) = type_check(snd, ctxt)?;
+            unifiers1.append(&mut unifiers2);
+            MonoType::constr(PROD, vec![fst_type, snd_type]).map(|m| (m, unifiers1))
         }
         Expr::Fst(prod) => {
-            let prod_type = type_check(prod, dict)?;
-            let mut expected_prod = Type::ProdT(
-                Box::new(Type::Free(dict.new_var())),
-                Box::new(Type::Free(dict.new_var())),
-            );
+            let (prod_type, mut unifiers) = type_check(prod, ctxt)?;
+            let mut expected_prod = MonoType::constr(
+                PROD,
+                vec![
+                    MonoType::Free(ctxt.new_var()),
+                    MonoType::Free(ctxt.new_var()),
+                ],
+            )?;
 
-            let unifier = expected_prod.unify(&prod_type)?;
-            dict.fix_from_unifier(&unifier);
+            let unifier = expected_prod.unify_with(&prod_type)?;
+            ctxt.fix_from_unifier(&unifier);
             expected_prod.instantiate_from_unifier(&unifier);
+            unifiers.push(unifier);
 
-            if let Type::ProdT(box fst, _) = expected_prod {
-                Ok(fst)
-            } else {
-                unreachable!()
-            }
+            expected_prod
+                .args(&PROD)?
+                .get(0)
+                .cloned()
+                .ok_or(TypeError::TypeMismatch)
+                .map(|m| (m, unifiers))
         }
         Expr::Snd(prod) => {
-            let prod_type = type_check(prod, dict)?;
-            let mut expected_prod = Type::ProdT(
-                Box::new(Type::Free(dict.new_var())),
-                Box::new(Type::Free(dict.new_var())),
-            );
+            let (prod_type, mut unifiers) = type_check(prod, ctxt)?;
+            let mut expected_prod = MonoType::constr(
+                PROD,
+                vec![
+                    MonoType::Free(ctxt.new_var()),
+                    MonoType::Free(ctxt.new_var()),
+                ],
+            )?;
 
-            let unifier = expected_prod.unify(&prod_type)?;
-            dict.fix_from_unifier(&unifier);
+            let unifier = expected_prod.unify_with(&prod_type)?;
+            ctxt.fix_from_unifier(&unifier);
             expected_prod.instantiate_from_unifier(&unifier);
+            unifiers.push(unifier);
 
-            if let Type::ProdT(_, box snd) = expected_prod {
-                Ok(snd)
-            } else {
-                unreachable!()
-            }
+            expected_prod
+                .args(&PROD)?
+                .get(1)
+                .cloned()
+                .ok_or(TypeError::TypeConstructorArgumentMismatch)
+                .map(|m| (m, unifiers))
         }
-        Expr::InjL(sum) => type_check_sum(sum, dict, |left, _, _| Ok(left)),
-        Expr::InjR(sum) => type_check_sum(sum, dict, |_, right, _| Ok(right)),
+        Expr::InjL(sum) => type_check_sum(sum, ctxt, |left, _, _, unifiers| {
+            Ok((left.clone(), unifiers))
+        }),
+        Expr::InjR(sum) => type_check_sum(sum, ctxt, |_, right, _, unifiers| {
+            Ok((right.clone(), unifiers))
+        }),
         Expr::Case {
             match_expr,
             left_name,
@@ -265,134 +282,164 @@ pub fn type_check(expr: &Expr, dict: &mut TypeDict) -> TypeResult {
             right_name,
             right_case,
         } => {
-            type_check_sum(match_expr, dict, |l_type, r_type, dict| {
+            type_check_sum(match_expr, ctxt, |l_type, r_type, ctxt, mut unifiers| {
                 // Shadow old variables.
                 let mut old_left_type = None;
                 let mut old_right_type = None;
 
                 if let Some(left_name) = left_name {
-                    old_left_type = dict.insert(left_name.clone(), l_type);
+                    old_left_type = ctxt.insert(left_name.clone(), Type::Mono(l_type.clone()));
                 }
-                let mut l_case_type = type_check(left_case, dict)?;
+                let (mut l_case_type, mut unifiers1) = type_check(left_case, ctxt)?;
+                unifiers.append(&mut unifiers1);
+                if let Some(left_name) = left_name {
+                    ctxt.drop_var(left_name);
+                }
 
                 if let Some(right_name) = right_name {
-                    old_right_type = dict.insert(right_name.clone(), r_type);
+                    old_right_type = ctxt.insert(right_name.clone(), Type::Mono(r_type.clone()));
                 }
-
-                let r_case_type = type_check(right_case, dict)?;
+                let (r_case_type, mut unifiers2) = type_check(right_case, ctxt)?;
+                unifiers.append(&mut unifiers2);
 
                 //Unshadow old variables in reverse order .
                 if let Some(right_name) = right_name {
                     if let Some(old_right_type) = old_right_type {
-                        dict.insert(right_name.clone(), old_right_type);
+                        ctxt.insert(right_name.clone(), old_right_type);
                     } else {
-                        dict.drop_var(right_name);
+                        ctxt.drop_var(right_name);
                     }
                 }
                 if let Some(left_name) = left_name {
                     if let Some(old_left_type) = old_left_type {
-                        dict.insert(left_name.clone(), old_left_type);
-                    } else {
-                        dict.drop_var(left_name);
+                        ctxt.insert(left_name.clone(), old_left_type);
                     }
                 }
 
                 // Make sure, both cases produce the same type.
-                let unifier = l_case_type.unify(&r_case_type)?;
+                let unifier = l_case_type.unify_with(&r_case_type)?;
                 l_case_type.instantiate_from_unifier(&unifier);
-                dict.fix_from_unifier(&unifier);
+                ctxt.fix_from_unifier(&unifier);
+                unifiers.push(unifier);
 
-                Ok(l_case_type)
+                Ok((l_case_type, unifiers))
             })
         }
         Expr::Fork(thread) => {
-            let thread_type = type_check(thread, dict)?;
-            let mut expected_thread_type =
-                Type::FunT(Box::new(Type::UnitT), Box::new(Type::Free(dict.new_var())));
-            let unifier = expected_thread_type.unify(&thread_type)?;
-            expected_thread_type.instantiate_from_unifier(&unifier);
-            dict.fix_from_unifier(&unifier);
-            Ok(expected_thread_type)
+            let (thread_type, mut unifiers) = type_check(thread, ctxt)?;
+            let expected_thread_type =
+                MonoType::constr(FUN, vec![MonoType::Id(UNIT), MonoType::Id(UNIT)])?;
+            let unifier = expected_thread_type.unify_with(&thread_type)?;
+            ctxt.fix_from_unifier(&unifier);
+            unifiers.push(unifier);
+
+            Ok((expected_thread_type, unifiers))
         }
         Expr::AllocN {
             array_len,
             initial_val,
         } => {
-            let len_type = type_check(array_len, dict)?;
-            let unifier = len_type.unify(&Type::IntT)?;
-            dict.fix_from_unifier(&unifier);
-            let val_type = type_check(initial_val, dict)?;
-            Ok(Type::LocationT(Box::new(val_type)))
+            let (len_type, mut unifiers1) = type_check(array_len, ctxt)?;
+            let unifier = len_type.unify_with(&INT_T)?;
+            ctxt.fix_from_unifier(&unifier);
+            unifiers1.push(unifier);
+
+            let (val_type, mut unifiers2) = type_check(initial_val, ctxt)?;
+            unifiers1.append(&mut unifiers2);
+            MonoType::constr(LOCATION, vec![val_type]).map(|m| (m, unifiers1))
         }
         Expr::Free(loc) => {
-            let loc_type = type_check(loc, dict)?;
-            let var = dict.new_var();
-            let unifier = loc_type.unify(&Type::LocationT(Box::new(Type::Free(var))))?;
-            dict.fix_from_unifier(&unifier);
-            Ok(Type::UnitT)
+            let (loc_type, mut unifiers) = type_check(loc, ctxt)?;
+            let expected_loc_type =
+                MonoType::constr(LOCATION, vec![MonoType::Free(ctxt.new_var())])?;
+            let unifier = loc_type.unify_with(&expected_loc_type)?;
+            ctxt.fix_from_unifier(&unifier);
+            unifiers.push(unifier);
+            Ok((UNIT_T, unifiers))
         }
         Expr::Load(loc) => {
-            let mut loc_type = type_check(loc, dict)?;
-            let var = dict.new_var();
+            let (loc_type, mut unifiers) = type_check(loc, ctxt)?;
+            let mut expected_loc_type =
+                MonoType::constr(LOCATION, vec![MonoType::Free(ctxt.new_var())])?;
+            let unifier = loc_type.unify_with(&expected_loc_type)?;
+            ctxt.fix_from_unifier(&unifier);
+            expected_loc_type.instantiate_from_unifier(&unifier);
+            unifiers.push(unifier);
 
-            let unifier = loc_type.unify(&Type::LocationT(Box::new(Type::Free(var))))?;
-            dict.fix_from_unifier(&unifier);
-            loc_type.instantiate_from_unifier(&unifier);
-
-            let stored_type = if let Type::LocationT(box stored_type) = loc_type {
-                stored_type
-            } else {
-                unreachable!()
-            };
-            Ok(stored_type)
+            expected_loc_type
+                .args(&LOCATION)?
+                .get(0)
+                .cloned()
+                .ok_or(TypeError::TypeConstructorArgumentMismatch)
+                .map(|m| (m, unifiers))
         }
         Expr::Store(loc, val) => {
-            let stored_type = type_check(val, dict)?;
-            let loc_type = type_check(loc, dict)?;
-            let unifier = loc_type.unify(&Type::LocationT(Box::new(stored_type)))?;
-            dict.fix_from_unifier(&unifier);
+            let (stored_type, mut unifiers1) = type_check(val, ctxt)?;
+            let (loc_type, mut unifiers2) = type_check(loc, ctxt)?;
+            unifiers1.append(&mut unifiers2);
 
-            Ok(Type::UnitT)
+            let expected_loc_type = MonoType::constr(LOCATION, vec![stored_type])?;
+            let unifier = loc_type.unify_with(&expected_loc_type)?;
+            ctxt.fix_from_unifier(&unifier);
+            unifiers1.push(unifier);
+
+            Ok((UNIT_T, unifiers1))
         }
         Expr::CmpXchg {
             location,
             expected_val,
             new_expr_val,
         } => {
-            let mut expected_val_type = type_check(expected_val, dict)?;
-            let new_expr_val_type = type_check(new_expr_val, dict)?;
-            let unifier1 = expected_val_type.unify(&new_expr_val_type)?;
+            let (mut expected_val_type, mut unifiers1) = type_check(expected_val, ctxt)?;
+            let (new_expr_val_type, mut unifiers2) = type_check(new_expr_val, ctxt)?;
+            unifiers1.append(&mut unifiers2);
+
+            let unifier1 = expected_val_type.unify_with(&new_expr_val_type)?;
             expected_val_type.instantiate_from_unifier(&unifier1);
-            dict.fix_from_unifier(&unifier1);
+            ctxt.fix_from_unifier(&unifier1);
+            unifiers1.push(unifier1);
 
-            let loc_type = type_check(location, dict)?;
-            let unifier2 = loc_type.unify(&Type::LocationT(Box::new(expected_val_type)))?;
-            dict.fix_from_unifier(&unifier2);
+            let (loc_type, mut unifiers3) = type_check(location, ctxt)?;
+            unifiers1.append(&mut unifiers3);
 
-            Ok(Type::BoolT)
+            let expected_loc_type = MonoType::constr(LOCATION, vec![expected_val_type])?;
+            let unifier2 = loc_type.unify_with(&expected_loc_type)?;
+            ctxt.fix_from_unifier(&unifier2);
+            unifiers1.push(unifier2);
+
+            Ok((BOOL_T, unifiers1))
         }
         Expr::Xchg {
             location,
             new_expr_val,
         } => {
-            let mut new_expr_val_type = type_check(new_expr_val, dict)?;
-            let loc_type = type_check(location, dict)?;
-            let unifier = loc_type.unify(&Type::LocationT(Box::new(new_expr_val_type.clone())))?;
-            new_expr_val_type.instantiate_from_unifier(&unifier);
-            dict.fix_from_unifier(&unifier);
+            let (mut new_expr_val_type, mut unifiers1) = type_check(new_expr_val, ctxt)?;
+            let (loc_type, mut unifiers2) = type_check(location, ctxt)?;
+            unifiers1.append(&mut unifiers2);
 
-            Ok(new_expr_val_type)
+            let expected_loc_type = MonoType::constr(LOCATION, vec![new_expr_val_type.clone()])?;
+            let unifier = loc_type.unify_with(&expected_loc_type)?;
+            new_expr_val_type.instantiate_from_unifier(&unifier);
+            ctxt.fix_from_unifier(&unifier);
+            unifiers1.push(unifier);
+
+            Ok((new_expr_val_type, unifiers1))
         }
         Expr::FAA { location, summand } => {
-            let loc_type = type_check(location, dict)?;
-            let unifier = loc_type.unify(&Type::LocationT(Box::new(Type::IntT)))?;
-            dict.fix_from_unifier(&unifier);
+            let (loc_type, mut unifiers1) = type_check(location, ctxt)?;
+            let expected_loc_type = MonoType::constr(LOCATION, vec![INT_T])?;
+            let unifier = loc_type.unify_with(&expected_loc_type)?;
+            ctxt.fix_from_unifier(&unifier);
+            unifiers1.push(unifier);
 
-            let summand_type = type_check(summand, dict)?;
-            let unifier = summand_type.unify(&Type::IntT)?;
-            dict.fix_from_unifier(&unifier);
+            let (summand_type, mut unifiers2) = type_check(summand, ctxt)?;
+            unifiers1.append(&mut unifiers2);
 
-            Ok(Type::IntT)
+            let unifier = summand_type.unify_with(&INT_T)?;
+            ctxt.fix_from_unifier(&unifier);
+            unifiers1.push(unifier);
+
+            Ok((INT_T, unifiers1))
         }
     }
 }
@@ -411,11 +458,11 @@ mod test {
             Box::new(Expr::Val(Box::new(Val::LitV(Literal::Int(3))))),
         );
 
-        let expected_type = Type::BoolT;
-        let mut dict = TypeDict::default();
-        let x_var = dict.new_var();
-        dict.insert("x".to_string(), Type::Free(x_var));
-        assert_eq!(expected_type, type_check(&term, &mut dict)?);
+        let expected_type = BOOL_T;
+        let mut ctxt = TypeContext::default();
+        let x_var = ctxt.new_var();
+        ctxt.insert("x".to_string(), Type::Mono(MonoType::Free(x_var)));
+        assert_eq!(expected_type, type_check(&term, &mut ctxt)?.0);
 
         let term = Rec {
             fun_name: Some("f".to_string()),
@@ -437,10 +484,10 @@ mod test {
                 )),
             }),
         };
-        let expected_type = Type::FunT(Box::new(Type::IntT), Box::new(Type::UnitT));
 
-        let mut dict = TypeDict::default();
-        assert_eq!(expected_type, type_check(&term, &mut dict)?);
+        let expected_type = MonoType::constr(FUN, vec![INT_T, UNIT_T])?;
+        let mut ctxt = TypeContext::default();
+        assert_eq!(expected_type, type_check(&term, &mut ctxt)?.0);
 
         Ok(())
     }
