@@ -124,7 +124,7 @@ impl TypeUnifier {
                 .cloned()
                 .or(Some(MonoType::Free(*var)))
         } else {
-            self.instantiations.get(&var).cloned()
+            self.instantiations.get(var).cloned()
         }
     }
 
@@ -148,8 +148,10 @@ impl TypeUnifier {
         Ok(())
     }
 
-    pub fn insert_inst(&mut self, var: &TypeVar, typ: MonoType) -> UnificationResult {
+    pub fn insert_inst(&mut self, var: &TypeVar, mut typ: MonoType) -> UnificationResult {
         let var = self.eqalize(var);
+        typ.instantiate_from_unifier(self);
+
         if let Some(old_type) = self.instantiations.get(&var) {
             if old_type != &typ {
                 Err(TypeUnificationError)
@@ -239,31 +241,6 @@ impl MonoType {
         }
         poly
     }
-
-    pub fn is_instance_of(&self, other: &MonoType) -> bool {
-        match (self, other) {
-            (MonoType::Id(id1), MonoType::Id(id2)) => id1 == id2,
-            (_, MonoType::Free(_)) => true,
-            (
-                MonoType::Constr {
-                    constr: constr1,
-                    arguments: args1,
-                },
-                MonoType::Constr {
-                    constr: constr2,
-                    arguments: args2,
-                },
-            ) => {
-                constr1 == constr2
-                    && args1.len() == args2.len()
-                    && args1
-                        .iter()
-                        .zip(args2.iter())
-                        .all(|(arg1, arg2)| arg1.is_instance_of(arg2))
-            }
-            _ => false,
-        }
-    }
 }
 
 impl Unifiable for MonoType {
@@ -295,7 +272,7 @@ impl Unifiable for MonoType {
         match self {
             MonoType::Free(v) => {
                 if let Some(typ) = unifier.get_or_var(v) {
-                    *self = typ.clone();
+                    *self = typ;
                 }
             }
             MonoType::Id(_) => (),
@@ -314,14 +291,15 @@ impl Unifiable for MonoType {
                 } else {
                     match (unifier.get_or_var(v1), unifier.get_or_var(v2)) {
                         (Some(t1), Some(t2)) => {
+                            // TODO: check whether the instantiations are unifiable
                             if t1 == t2 {
                                 Ok(())
                             } else {
                                 Err(TypeUnificationError)
                             }
                         }
-                        (Some(t), _) => unifier.insert_inst(v2, t.clone()),
-                        (_, Some(t)) => unifier.insert_inst(v1, t.clone()),
+                        (Some(t), _) => unifier.insert_inst(v2, t),
+                        (_, Some(t)) => unifier.insert_inst(v1, t),
                         _ => unifier.insert_eq(v1, v2),
                     }
                 }
@@ -403,6 +381,7 @@ impl Unifiable for Type {
     }
 
     fn unify(&self, other: &Type, unifier: &mut TypeUnifier) -> UnificationResult {
+        // TODO: Unify also with instantiation, i.e. if one type is an instance of the other.
         match (self, other) {
             (Type::Mono(m1), Type::Mono(m2)) => m1.unify(m2, unifier),
             (
@@ -565,5 +544,132 @@ mod test {
         ctxt.new_var_counter = TypeVar(3);
         assert_eq!(ctxt.monomorphize(&poly), expected_mono);
         Ok(())
+    }
+
+    #[test]
+    fn test_polymorphize() {
+        let mono = MonoType::Constr {
+            constr: SUM,
+            arguments: vec![MonoType::Free(TypeVar(3)), MonoType::Id(INT)],
+        };
+        let poly = Type::Poly {
+            var: TypeVar(3),
+            body: Box::new(Type::Mono(mono.clone())),
+        };
+        assert_eq!(poly, mono.polymorphize());
+    }
+
+    #[test]
+    fn test_unify() -> UnificationResult {
+        let mut type1 = MonoType::Constr {
+            constr: FUN,
+            arguments: vec![
+                MonoType::Constr {
+                    constr: SUM,
+                    arguments: vec![MonoType::Free(TypeVar(3)), BOOL_T],
+                },
+                MonoType::Free(TypeVar(21)),
+            ],
+        };
+        let mut type2 = MonoType::Constr {
+            constr: FUN,
+            arguments: vec![
+                MonoType::Constr {
+                    constr: SUM,
+                    arguments: vec![INT_T, BOOL_T],
+                },
+                MonoType::Constr {
+                    constr: PROD,
+                    arguments: vec![UNIT_T, MonoType::Free(TypeVar(3))],
+                },
+            ],
+        };
+        let unified = MonoType::Constr {
+            constr: FUN,
+            arguments: vec![
+                MonoType::Constr {
+                    constr: SUM,
+                    arguments: vec![INT_T, BOOL_T],
+                },
+                MonoType::Constr {
+                    constr: PROD,
+                    arguments: vec![UNIT_T, INT_T],
+                },
+            ],
+        };
+
+        // Occurs check fails.
+        let not_unifiable1 = MonoType::Constr {
+            constr: FUN,
+            arguments: vec![
+                MonoType::Constr {
+                    constr: SUM,
+                    arguments: vec![MonoType::Free(TypeVar(21)), BOOL_T],
+                },
+                MonoType::Constr {
+                    constr: PROD,
+                    arguments: vec![UNIT_T, MonoType::Free(TypeVar(3))],
+                },
+            ],
+        };
+        let err1 = type1.unify_with(&not_unifiable1);
+        assert_eq!(err1, Err(TypeUnificationError));
+
+        // Different values for the same type variable
+        let not_unifiable2 = MonoType::Constr {
+            constr: FUN,
+            arguments: vec![
+                MonoType::Constr {
+                    constr: SUM,
+                    arguments: vec![INT_T, MonoType::Free(TypeVar(3))],
+                },
+                MonoType::Constr {
+                    constr: PROD,
+                    arguments: vec![UNIT_T, MonoType::Free(TypeVar(3))],
+                },
+            ],
+        };
+        let err2 = type1.unify_with(&not_unifiable2);
+        assert_eq!(err2, Err(TypeUnificationError));
+
+        let unifier1 = type1.unify_with(&type2)?;
+        let unifier2 = type1.unify_with(&unified)?;
+        let unifier3 = type2.unify_with(&type1)?;
+        assert_eq!(unifier1, unifier2);
+        assert_eq!(unifier1, unifier3);
+
+        type1.instantiate_from_unifier(&unifier1);
+        assert_eq!(type1, unified);
+
+        type2.instantiate_from_unifier(&unifier3);
+        assert_eq!(type2, unified);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_generalize() {
+        let mut ctxt = TypeContext::default();
+        let bound_var = TypeVar(12);
+        let free_var1 = TypeVar(21);
+        let free_var2 = TypeVar(7);
+        let typ = Type::Poly {
+            var: bound_var,
+            body: Box::new(Type::Mono(MonoType::Constr {
+                constr: SUM,
+                arguments: vec![MonoType::Free(bound_var), MonoType::Free(free_var1)],
+            })),
+        };
+        assert_eq!(None, ctxt.insert("x".to_string(), typ));
+
+        let mono = MonoType::Constr {
+            constr: FUN,
+            arguments: vec![MonoType::Free(free_var1), MonoType::Free(free_var2)],
+        };
+        let generalized = Type::Poly {
+            var: free_var2,
+            body: Box::new(Type::Mono(mono.clone())),
+        };
+        assert_eq!(ctxt.generalize(mono), generalized);
     }
 }

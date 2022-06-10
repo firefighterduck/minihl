@@ -1,8 +1,18 @@
 //! The definition of MiniHeapLang
 
 /// Heap locations in HeapLang.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Loc(usize);
+
+impl Loc {
+    pub fn offset(self, offset: i32) -> Loc {
+        Loc((self.0 as i32 + offset) as usize)
+    }
+
+    pub fn new(n: usize) -> Loc {
+        Loc(n)
+    }
+}
 
 /// HeapLang literals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,9 +75,7 @@ pub enum Expr {
     InjR(Box<Expr>),
     Case {
         match_expr: Box<Expr>,
-        left_name: Binder,
         left_case: Box<Expr>,
-        right_name: Binder,
         right_case: Box<Expr>,
     },
     Fork(Box<Expr>),
@@ -104,7 +112,7 @@ pub enum Val {
     },
     PairV(Box<Val>, Box<Val>),
     InjLV(Box<Val>),
-    InjR(Box<Val>),
+    InjRV(Box<Val>),
 }
 
 impl Expr {
@@ -153,18 +161,12 @@ impl Expr {
             Expr::InjR(sum) => sum.subst_var(var_name, new_val),
             Expr::Case {
                 match_expr,
-                left_name,
                 left_case,
-                right_name,
                 right_case,
             } => {
                 match_expr.subst_var(var_name.clone(), new_val.clone());
-                if left_name != &Some(var_name.clone()) {
-                    left_case.subst_var(var_name.clone(), new_val.clone());
-                }
-                if right_name != &Some(var_name.clone()) {
-                    right_case.subst_var(var_name, new_val)
-                }
+                left_case.subst_var(var_name.clone(), new_val.clone());
+                right_case.subst_var(var_name, new_val)
             }
             Expr::Fork(new_thread) => new_thread.subst_var(var_name, new_val),
             Expr::AllocN {
@@ -200,6 +202,66 @@ impl Expr {
                 location.subst_var(var_name.clone(), new_val.clone());
                 summand.subst_var(var_name, new_val)
             }
+        }
+    }
+
+    pub fn highest_loc(&self) -> usize {
+        match self {
+            Expr::Val(v) => {
+                if let box Val::LitV(Literal::Loc(Loc(l))) = v {
+                    *l
+                } else {
+                    0
+                }
+            }
+            Expr::Var(_) => 0,
+            Expr::Rec { expr, .. } => expr.highest_loc(),
+            Expr::App(fun, arg) => fun.highest_loc().max(arg.highest_loc()),
+            Expr::UnOp(_, arg) => arg.highest_loc(),
+            Expr::BinOp(_, arg1, arg2) => arg1.highest_loc().max(arg2.highest_loc()),
+            Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => condition
+                .highest_loc()
+                .max(then_branch.highest_loc())
+                .max(else_branch.highest_loc()),
+            Expr::Pair(fst, snd) => fst.highest_loc().max(snd.highest_loc()),
+            Expr::Fst(p) => p.highest_loc(),
+            Expr::Snd(p) => p.highest_loc(),
+            Expr::InjL(l) => l.highest_loc(),
+            Expr::InjR(r) => r.highest_loc(),
+            Expr::Case {
+                match_expr,
+                left_case,
+                right_case,
+                ..
+            } => match_expr
+                .highest_loc()
+                .max(left_case.highest_loc())
+                .max(right_case.highest_loc()),
+            Expr::Fork(e) => e.highest_loc(),
+            Expr::AllocN {
+                array_len,
+                initial_val,
+            } => array_len.highest_loc().max(initial_val.highest_loc()),
+            Expr::Free(l) => l.highest_loc(),
+            Expr::Load(l) => l.highest_loc(),
+            Expr::Store(loc, val) => loc.highest_loc().max(val.highest_loc()),
+            Expr::CmpXchg {
+                location,
+                expected_val,
+                new_expr_val,
+            } => location
+                .highest_loc()
+                .max(expected_val.highest_loc())
+                .max(new_expr_val.highest_loc()),
+            Expr::Xchg {
+                location,
+                new_expr_val,
+            } => location.highest_loc().max(new_expr_val.highest_loc()),
+            Expr::FAA { location, summand } => location.highest_loc().max(summand.highest_loc()),
         }
     }
 }
